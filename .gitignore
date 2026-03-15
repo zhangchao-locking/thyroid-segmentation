@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Model weights (too large for GitHub)
+*.pth
+*.pt
+
+# Data
+*.jpg
+*.png
+*.jpeg
+*.bmp
+
+# Results
+results/
+图像分割可视化/
+
+# OS
+.DS_Store
+Thumbs.db
