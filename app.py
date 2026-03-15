@@ -5,12 +5,18 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 import os
 import matplotlib.pyplot as plt
+import tempfile
+import requests
+import json
 
 from models.nnunet import PlainUNet as nnUNet
 from models.mk_unet import MKUNet
 from models.configs.base_config import Config
 
 config = Config()
+
+SILICON_FLOW_API_KEY = "sk-kazokscgjsxdzlasbhcviczhwhmzdytkynihovylnvwczfvc"
+SILICON_FLOW_API_URL = "https://api.siliconflow.cn/v1/chat/completions"
 
 st.set_page_config(
     page_title="甲状腺结节分割系统",
@@ -20,7 +26,7 @@ st.set_page_config(
 )
 
 @st.cache_resource
-def load_models():
+def load_models(uploaded_files=None):
     models = {}
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -29,15 +35,28 @@ def load_models():
         ('MKUNet', MKUNet, config.MODEL_FEATURES['MKUNet']),
     ]
 
-    for name, model_class, features in model_configs:
-        model = model_class(in_channels=1, out_channels=2, features=features)
-        model_path = f'results/{name}/best_model.pth'
+    if uploaded_files:
+        for name, model_class, features in model_configs:
+            model = model_class(in_channels=1, out_channels=2, features=features)
+            if name in uploaded_files and uploaded_files[name] is not None:
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pth') as tmp:
+                    tmp.write(uploaded_files[name].read())
+                    tmp_path = tmp.name
+                model.load_state_dict(torch.load(tmp_path, map_location=device))
+                os.unlink(tmp_path)
+                model.to(device)
+                model.eval()
+                models[name] = model
+    else:
+        for name, model_class, features in model_configs:
+            model = model_class(in_channels=1, out_channels=2, features=features)
+            model_path = f'results/{name}/best_model.pth'
 
-        if os.path.exists(model_path):
-            model.load_state_dict(torch.load(model_path, map_location=device))
-            model.to(device)
-            model.eval()
-            models[name] = model
+            if os.path.exists(model_path):
+                model.load_state_dict(torch.load(model_path, map_location=device))
+                model.to(device)
+                model.eval()
+                models[name] = model
 
     return models, device
 
@@ -70,7 +89,8 @@ def create_comparison(image, mask):
     img_rgb = img_rgb.resize((448, 384))
     img_rgb = np.array(img_rgb)
 
-    mask_uint8 = (mask * 255).astype(np.uint8)
+    mask_resized = np.array(mask.resize((448, 384)))
+    mask_uint8 = (mask_resized > 0).astype(np.uint8)
 
     overlay = img_rgb.copy()
     for i in range(3):
@@ -83,12 +103,48 @@ def create_comparison(image, mask):
                                        np.minimum(overlay[:, :, i] + 50, 255), 
                                        overlay[:, :, i])
 
-    edges = get_edge(mask)
+    edges = get_edge(mask_uint8)
+    edges_bool = edges > 0
     for i in range(3):
-        overlay[:, :, i] = np.where(edges > 0, 0, overlay[:, :, i])
-    overlay[:, 1] = np.where(edges > 0, np.maximum(overlay[:, 1], 200), overlay[:, 1])
+        overlay[:, :, i] = np.where(edges_bool, 0, overlay[:, :, i])
+    overlay[:, :, 1] = np.where(edges_bool, np.maximum(overlay[:, :, 1], 200), overlay[:, :, 1])
 
     return overlay
+
+def analyze_with_ai(area, perimeter, model_name):
+    headers = {
+        "Authorization": f"Bearer {SILICON_FLOW_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    prompt = f"""你是一位专业的甲状腺超声诊断医生。请根据以下分割结果数据，给出诊断分析建议：
+
+分割模型：{model_name}
+分割面积：{area} 像素（约 {area/100:.1f} 平方毫米，假设1像素=0.1毫米）
+边缘点数：{perimeter}（反映结节边缘的复杂程度）
+
+请给出：
+1. 对结节大小和形态的初步判断
+2. 对结节边缘特征的分析
+3. 临床建议
+
+请用简洁易懂的语言回答，最多150字。"""
+
+    data = {
+        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 500,
+        "temperature": 0.7
+    }
+    
+    try:
+        response = requests.post(SILICON_FLOW_API_URL, headers=headers, json=data, timeout=30)
+        result = response.json()
+        return result['choices'][0]['message']['content']
+    except Exception as e:
+        return f"AI分析暂时不可用: {str(e)}"
 
 st.markdown("""
 <style>
@@ -126,6 +182,28 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">🩺 甲状腺结节超声图像分割系统</div>', unsafe_allow_html=True)
+
+st.markdown("---")
+
+with st.sidebar:
+    st.markdown("### 📁 上传模型文件")
+    st.markdown("如部署在云端，请上传模型文件（本地运行可跳过）")
+    
+    nnunet_file = st.file_uploader("上传 nnUNet 模型 (.pth)", type=['pth'], key='nnunet')
+    mkunet_file = st.file_uploader("上传 MKUNet 模型 (.pth)", type=['pth'], key='mkunet')
+    
+    uploaded_files = {}
+    if nnunet_file:
+        uploaded_files['nnUNet'] = nnunet_file
+    if mkunet_file:
+        uploaded_files['MKUNet'] = mkunet_file
+    
+    if uploaded_files:
+        st.success("✅ 模型已上传")
+        models, device = load_models(uploaded_files)
+    else:
+        st.info("使用本地模型")
+        models, device = load_models()
 
 st.markdown("---")
 
@@ -182,16 +260,15 @@ with col2:
         st.info("👆 点击「开始分析」按钮进行分割")
     else:
         with st.spinner('🤖 AI 分析中...'):
-            models, device = load_models()
-
             if model_choice not in models:
-                st.error(f"模型 {model_choice} 未找到，请先训练模型")
+                st.error(f"模型 {model_choice} 未找到，请先上传模型文件")
             else:
                 img_tensor = preprocess_image(image)
                 pred = segment_image(models[model_choice], img_tensor, device)
                 pred_binary = (pred > 0).astype(np.uint8)
+                pred_image = Image.fromarray(pred_binary * 255)
 
-                result_img = create_comparison(image, pred_binary)
+                result_img = create_comparison(image, pred_image)
 
                 st.image(result_img, caption=f"{model_choice} 分割结果", use_container_width=True)
 
@@ -220,6 +297,11 @@ with col2:
                     st.metric("边缘点数", f"{perimeter}")
 
                 st.success("✅ 分析完成！")
+                
+                with st.expander("🤖 AI 智能分析"):
+                    with st.spinner('🤖 AI 正在分析...'):
+                        ai_analysis = analyze_with_ai(area, perimeter, model_choice)
+                    st.markdown(ai_analysis)
 
 st.markdown("---")
 
@@ -229,8 +311,8 @@ with col1:
     st.markdown("""
     ### 📋 系统说明
 
-    本系统基于 nnU-Net V2 最优参数，对8种主流分割模型进行对比实验。
-    当前演示包含 **nnUNet** 和 **MKUNet** 两个模型。
+    本系统基于 nnU-Net V2 最优参数，对甲状腺结节超声图像进行分割。
+    包含 **nnUNet** 和 **MKUNet** 两个模型。
 
     **模型特点:**
     - **nnUNet**: 自适应配置框架，自动确定最佳预处理和训练参数
@@ -248,6 +330,6 @@ with col1:
 st.markdown("""
 <div style="text-align: center; color: #666; padding: 20px;">
     <p>🏥 基于深度学习的甲状腺结节超声图像分割系统</p>
-    <p>使用 nnU-Net V2 最优参数 | 对比实验系统</p>
+    <p>Powered by 硅基流动 (SiliconFlow) AI</p>
 </div>
 """, unsafe_allow_html=True)
